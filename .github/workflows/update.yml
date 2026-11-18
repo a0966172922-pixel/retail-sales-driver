@@ -1,0 +1,70 @@
+name: 更新 Retail Sales Driver
+
+on:
+  schedule:
+    # 週一到週五 UTC 14:07（台北 22:07）。Census 在美東 8:30 發布，夏令與標準時間都已經過了；
+    # Census 的整包下載有 CDN 快取（約數分鐘），發布後 37 分鐘以上再抓比較保險。
+    - cron: "7 14 * * 1-5"
+  workflow_dispatch:       # 在 Actions 頁面可以手動執行
+  push:
+    branches: [main]
+    paths: ["site/**", "pipeline/**", "build_site.py", ".github/workflows/update.yml"]
+
+permissions:
+  contents: write          # 把新資料 commit 回 repo
+  pages: write             # 部署 GitHub Pages
+  id-token: write
+
+concurrency:
+  group: retail-sales-driver
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: 從 Census 抓資料並檢查
+        env:
+          CENSUS_API_KEY: ${{ secrets.CENSUS_API_KEY }}   # 選用：整包下載失敗時才會用 API
+        run: python pipeline/build_data.py --out data/retail.json
+
+      - name: 檢查資料有沒有變動
+        id: diff
+        run: |
+          if git diff --quiet -- data/retail.json; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Census 沒有新資料"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 保存新資料
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/retail.json
+          git commit -m "Census 資料更新：$(python -c 'import json; print(json.load(open("data/retail.json", encoding="utf-8"))["vintage"])')"
+          git push
+
+      - name: 產生網頁
+        if: steps.diff.outputs.changed == 'true' || github.event_name != 'schedule'
+        run: python build_site.py data/retail.json public/index.html
+
+      - uses: actions/upload-pages-artifact@v5
+        if: steps.diff.outputs.changed == 'true' || github.event_name != 'schedule'
+        with:
+          path: public
+
+      - id: deploy
+        uses: actions/deploy-pages@v5
+        if: steps.diff.outputs.changed == 'true' || github.event_name != 'schedule'
