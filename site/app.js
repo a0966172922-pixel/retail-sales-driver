@@ -575,7 +575,19 @@
   if (!PRESETS.some(p => p.id === presetId)) presetId = "half";
   const preset = () => PRESETS.find(p => p.id === presetId);
   const defaultColor = slot => slot === "line" ? INK : slot === "other" ? OTHER_HEX : CORP[slot - 1] || OTHER_HEX;
-  const exportColor = slot => customColors[slot] || defaultColor(slot);
+  // 下載圖的顏色只能從程式預設的色票挑：公司 9 色、「其他」的灰色、總計線的黑色
+  const PALETTE_NAMES = ["深藍", "橘", "深綠", "天藍", "紫", "綠", "青綠", "粉紅", "紅"];
+  const PALETTE = [...CORP.map((h, i) => [h, PALETTE_NAMES[i]]), [OTHER_HEX, "灰"], [INK, "黑"]];
+  const inPalette = c => typeof c === "string" && PALETTE.some(([h]) => h.toLowerCase() === c.toLowerCase());
+  const exportColor = slot => inPalette(customColors[slot]) ? customColors[slot] : defaultColor(slot);   // 以前存的非色票顏色一律改回預設
+  // 圖例靠左或置中；總計線實線或虛線、粗細（點）
+  const ALIGN_KEY = "retail-sales-driver-export-legend-align", LINE_KEY = "retail-sales-driver-export-line";
+  const LINE_WIDTHS = [0.75, 1, 1.5, 2, 2.5, 3];
+  let legendAlign = load(ALIGN_KEY, "left") === "center" ? "center" : "left";
+  let lineStyle = load(LINE_KEY, { dash: false, width: 1.5 });
+  if (!lineStyle || typeof lineStyle !== "object" || !LINE_WIDTHS.includes(+lineStyle.width)) lineStyle = { dash: false, width: 1.5 };
+  lineStyle = { dash: !!lineStyle.dash, width: +lineStyle.width };
+  const dashPt = w => [Math.max(3, 3 * w), Math.max(2, 2 * w)];          // 虛線的線段與間隔長度（點），隨粗細放大
   const nameKey = (id, def) => `${id}|${def}`;
   const exportName = (id, def) => { const v = customNames[nameKey(id, def)]; return v && v.trim() ? v.trim() : def; };
   // y 軸範圍：依圖表模式分開記（金額與貢獻的數字差很多），只用在下載的圖片，重新整理後恢復自動
@@ -593,11 +605,19 @@
     g.font = L.font;
     let x = L.padX;
     for (const it of items) {
-      const mark = it.kind === "line" ? L.lineW : L.sw;
+      let mark = it.kind === "line" ? L.lineW : L.sw;
+      if (it.kind === "line" && it.dash) { const [d, gp] = dashPt(it.lw || 1.5); mark = Math.max(mark, (2 * d + gp) * pt); }   // 虛線圖例至少看得到兩段
       const w = mark + L.gapIn + g.measureText(it.name).width;
       if (L.rows[L.rows.length - 1].length && x + w > pxW - L.padX) { L.rows.push([]); x = L.padX; }
-      L.rows[L.rows.length - 1].push({ ...it, x, mark });
+      L.rows[L.rows.length - 1].push({ ...it, x, mark, w });
       x += w + L.gapOut;
+    }
+    if (legendAlign === "center") {
+      for (const row of L.rows) {
+        if (!row.length) continue;
+        const last = row[row.length - 1], shift = (pxW - 2 * L.padX - (last.x + last.w - L.padX)) / 2;
+        for (const it of row) it.x += shift;
+      }
     }
     L.height = L.top0 + L.rows.length * L.rowH;
     return L;
@@ -614,7 +634,7 @@
     g.fillStyle = "#FFFFFF"; g.fillRect(0, 0, pxW, pxH);
 
     const items = segMeta.map(s => ({ name: exportName(s.id, s.def), color: exportColor(s.slot), kind: "box" }));
-    if (lineShown()) items.push({ name: exportName("line", lineName()), color: exportColor("line"), kind: "line" });
+    if (lineShown()) items.push({ name: exportName("line", lineName()), color: exportColor("line"), kind: "line", lw: lineStyle.width, dash: lineStyle.dash });
     let L;
     if (fontChoice === "auto") {
       for (const f of AUTO_SIZES) { L = layoutLegend(g, items, f, pxW, pt); if (L.height <= pxH * 0.28) break; }
@@ -626,7 +646,12 @@
       const cy = L.top0 + r * L.rowH + L.rowH / 2;
       for (const it of row) {
         if (it.kind === "box") { g.fillStyle = it.color; g.fillRect(it.x, cy - L.sh / 2, L.sw, L.sh); }
-        else { g.strokeStyle = it.color; g.lineWidth = 1.5 * pt; g.beginPath(); g.moveTo(it.x, cy); g.lineTo(it.x + L.lineW, cy); g.stroke(); }
+        else {
+          const lw = it.lw || 1.5;
+          g.strokeStyle = it.color; g.lineWidth = lw * pt; g.lineCap = "butt";
+          g.setLineDash(it.dash ? dashPt(lw).map(v => v * pt) : []);
+          g.beginPath(); g.moveTo(it.x, cy); g.lineTo(it.x + it.mark, cy); g.stroke(); g.setLineDash([]);
+        }
         g.fillStyle = INK; g.font = L.font;
         g.fillText(it.name, it.x + it.mark + L.gapIn, cy);
       }
@@ -709,10 +734,12 @@
       g.beginPath(); g.moveTo(plot.l, Math.round(Y(0)) + 0.5); g.lineTo(plot.r, Math.round(Y(0)) + 0.5); g.stroke();
     }
     if (lineShown()) {
-      g.strokeStyle = exportColor("line"); g.lineWidth = 1.5 * pt; g.lineJoin = "round"; g.lineCap = "round";
+      g.strokeStyle = exportColor("line"); g.lineWidth = lineStyle.width * pt; g.lineJoin = "round"; g.lineCap = lineStyle.dash ? "butt" : "round";
+      g.setLineDash(lineStyle.dash ? dashPt(lineStyle.width).map(v => v * pt) : []);
       g.beginPath();
       series.forEach((p, i) => { const yy = Y(p.total); if (i) g.lineTo(cx(i), yy); else g.moveTo(cx(i), yy); });
       g.stroke();
+      g.setLineDash([]);
     }
     g.restore();
     if (lo >= 0 || hi <= 0) {                      // 座標不含 0 時，在底部畫一條軸線
@@ -764,7 +791,15 @@
       warn.hidden = false;
     } else warn.hidden = true;
   }
+  function syncExportOptions() {
+    $("ex-legend-align").querySelectorAll("button").forEach(b => b.setAttribute("aria-pressed", String(b.dataset.align === legendAlign)));
+    $("ex-line-dash").querySelectorAll("button").forEach(b => b.setAttribute("aria-pressed", String((b.dataset.dash === "1") === lineStyle.dash)));
+    $("ex-line-width").value = String(lineStyle.width);
+    $("ex-line-field").hidden = isCombo();
+  }
   function renderExportPanel() {
+    closePalette();
+    syncExportOptions();
     const focusId = document.activeElement && panel.contains(document.activeElement) ? document.activeElement.id : null;
     $("ex-preset").innerHTML = PRESETS.map(p => `<button type="button" id="ex-p-${p.id}" data-preset="${p.id}" aria-pressed="${p.id === presetId}">${p.label}</button>`).join("");
     const rows = [];
@@ -774,7 +809,7 @@
       combo.forEach((x, i) => {
         const def = seriesLabel(x), key = comboKey(x);
         rows.push(`<div class="ex-row">
-        <span class="ex-spacer"></span><input type="color" class="ex-color" id="ex-color-c${i}" data-slot="${i + 1}" value="${exportColor(i + 1)}" aria-label="${esc(def)} 在下載圖上的顏色（第 ${i + 1} 色）">
+        <span class="ex-spacer"></span><button type="button" class="ex-color" id="ex-color-c${i}" data-slot="${i + 1}" style="background:${exportColor(i + 1)}" aria-haspopup="dialog" aria-expanded="false" aria-label="${esc(def)} 在下載圖上的顏色（第 ${i + 1} 色），點一下選色"></button>
         <input type="text" id="ex-name-c${i}" data-id="${esc(key)}" data-def="${esc(def)}" value="${esc(exportName(key, def))}" aria-label="${esc(def)} 在下載圖上的名稱">
       </div>`);
       });
@@ -791,18 +826,18 @@
       const on = !hid.has(k), def = name(k), slot = plan.slot.get(k);
       rows.push(`<div class="ex-row${on ? "" : " off"}">
         <input type="checkbox" id="ex-show-${k}" data-key="${k}" ${on ? "checked" : ""} aria-label="在圖上顯示 ${esc(def)}">
-        <input type="color" class="ex-color" id="ex-color-${k}" data-slot="${slot}" value="${exportColor(slot)}" ${on ? "" : "disabled"} aria-label="${esc(def)} 在下載圖上的顏色（第 ${slot} 色）">
+        <button type="button" class="ex-color" id="ex-color-${k}" data-slot="${slot}" style="background:${exportColor(slot)}" ${on ? "" : "disabled"} aria-haspopup="dialog" aria-expanded="false" aria-label="${esc(def)} 在下載圖上的顏色（第 ${slot} 色），點一下選色"></button>
         <input type="text" id="ex-name-${k}" data-id="${k}" data-def="${esc(def)}" value="${esc(exportName(k, def))}" ${on ? "" : "disabled"} aria-label="${esc(def)} 在下載圖上的名稱">
       </div>`);
     }
     if (segMeta.some(s => s.key === "other")) rows.push(`<div class="ex-row">
-        <span class="ex-spacer"></span><input type="color" class="ex-color" id="ex-color-other" data-slot="other" value="${exportColor("other")}" aria-label="「其他」在下載圖上的顏色">
+        <span class="ex-spacer"></span><button type="button" class="ex-color" id="ex-color-other" data-slot="other" style="background:${exportColor("other")}" aria-haspopup="dialog" aria-expanded="false" aria-label="「其他」在下載圖上的顏色，點一下選色"></button>
         <input type="text" id="ex-name-other" data-id="other" data-def="其他" value="${esc(exportName("other", "其他"))}" aria-label="「其他」在下載圖上的名稱">
       </div>`);
     const ld = lineName();
     rows.push(`<div class="ex-row${lineShown() ? "" : " off"}">
         <input type="checkbox" id="ex-show-line" data-key="line" ${lineShown() ? "checked" : ""} aria-label="在圖上顯示總計線">
-        <input type="color" class="ex-color" id="ex-color-line" data-slot="line" value="${exportColor("line")}" ${lineShown() ? "" : "disabled"} aria-label="總計線在下載圖上的顏色">
+        <button type="button" class="ex-color" id="ex-color-line" data-slot="line" style="background:${exportColor("line")}" ${lineShown() ? "" : "disabled"} aria-haspopup="dialog" aria-expanded="false" aria-label="總計線在下載圖上的顏色，點一下選色"></button>
         <input type="text" id="ex-name-line" data-id="line" data-def="${esc(ld)}" value="${esc(exportName("line", ld))}" ${lineShown() ? "" : "disabled"} aria-label="總計線在下載圖上的名稱">
       </div>`);
     $("ex-items").innerHTML = rows.join("");
@@ -813,29 +848,69 @@
     if (focusId && $(focusId)) $(focusId).focus();
     updatePreview();
   }
+  // 色票彈出框
+  let paletteBtn = null;
+  const slotVal = slot => isNaN(+slot) ? slot : +slot;
+  function closePalette() {
+    const pal = $("ex-palette");
+    if (pal.hidden) return;
+    pal.hidden = true;
+    if (paletteBtn) paletteBtn.setAttribute("aria-expanded", "false");
+    paletteBtn = null;
+  }
+  function openPalette(btn) {
+    const pal = $("ex-palette"), cur = exportColor(slotVal(btn.dataset.slot)).toLowerCase();
+    pal.innerHTML = PALETTE.map(([h, n], i) => `<button type="button" class="ex-sw" id="ex-sw-${i}" data-pick="${h}" style="background:${h}" title="${n} ${h}" aria-label="${n} ${h}" aria-pressed="${h.toLowerCase() === cur}"></button>`).join("") +
+      `<button type="button" class="dl-btn ex-sw-reset" id="ex-sw-default" data-pick="default">改回這個位置的預設顏色</button>`;
+    pal.hidden = false;
+    paletteBtn = btn; btn.setAttribute("aria-expanded", "true");
+    // 色票放在色塊正下方（相對於下載設定欄位定位，頁面捲動時跟著一起移動）
+    const fr = pal.parentElement.getBoundingClientRect(), r = btn.getBoundingClientRect();
+    pal.style.left = Math.max(0, Math.min(r.left - fr.left, fr.width - pal.offsetWidth)) + "px";
+    pal.style.top = (r.bottom - fr.top + 6) + "px";
+    const on = pal.querySelector('[aria-pressed="true"]') || pal.querySelector(".ex-sw");
+    if (on) on.focus({ preventScroll: true });
+  }
+  function pickColor(hex) {
+    if (!paletteBtn) return;
+    const btn = paletteBtn, slot = btn.dataset.slot, def = defaultColor(slotVal(slot));
+    if (hex === "default" || hex.toLowerCase() === def.toLowerCase()) delete customColors[slot]; else customColors[slot] = hex;
+    save(COLORS_KEY, customColors);
+    btn.style.background = exportColor(slotVal(slot));
+    closePalette();
+    btn.focus();
+    schedulePreview();
+  }
+  document.addEventListener("click", e => {
+    if (!paletteBtn) return;
+    if (!e.target.closest("#ex-palette") && e.target.closest(".ex-color") !== paletteBtn) closePalette();
+  });
+  document.addEventListener("keydown", e => { if (e.key === "Escape" && paletteBtn) { const b = paletteBtn; closePalette(); b.focus(); } });
+  window.addEventListener("resize", closePalette);
+
   panel.addEventListener("click", e => {
     const b = e.target.closest("[data-preset]");
-    if (b) { presetId = b.dataset.preset; save(PRESET_KEY, presetId); renderExportPanel(); }
+    if (b) { presetId = b.dataset.preset; save(PRESET_KEY, presetId); renderExportPanel(); return; }
+    const sw = e.target.closest("[data-pick]");
+    if (sw) { pickColor(sw.dataset.pick); return; }
+    const cb = e.target.closest("button.ex-color");
+    if (cb && !cb.disabled) { if (paletteBtn === cb) closePalette(); else openPalette(cb); return; }
+    const al = e.target.closest("[data-align]");
+    if (al) { legendAlign = al.dataset.align; save(ALIGN_KEY, legendAlign); syncExportOptions(); updatePreview(); return; }
+    const ds = e.target.closest("[data-dash]");
+    if (ds) { lineStyle.dash = ds.dataset.dash === "1"; save(LINE_KEY, lineStyle); syncExportOptions(); updatePreview(); }
   });
   panel.addEventListener("change", e => {
     const cb = e.target.closest('input[type="checkbox"][data-key]');
     if (cb) { toggleItem(cb.dataset.key); return; }
     if (e.target.id === "ex-font") { fontChoice = e.target.value; save(FONT_KEY, fontChoice); updatePreview(); }
+    if (e.target.id === "ex-line-width") { lineStyle.width = +e.target.value; save(LINE_KEY, lineStyle); updatePreview(); }
   });
   panel.addEventListener("input", e => {
     const yk = { "ex-ymin": [rangeKey(), 0], "ex-ymax": [rangeKey(), 1], "ex-y2min": ["comboR", 0], "ex-y2max": ["comboR", 1] }[e.target.id];
     if (yk) {
       const v = e.target.value.trim(), n = v === "" ? null : Number(v);
       yRange[yk[0]][yk[1]] = n === null || !isFinite(n) ? null : n;
-      schedulePreview();
-      return;
-    }
-    const c = e.target.closest('input[type="color"][data-slot]');
-    if (c) {
-      const slot = c.dataset.slot;
-      if (c.value.toLowerCase() === defaultColor(isNaN(+slot) ? slot : +slot).toLowerCase()) delete customColors[slot];
-      else customColors[slot] = c.value;
-      save(COLORS_KEY, customColors);
       schedulePreview();
       return;
     }
@@ -1208,7 +1283,12 @@
       const cy = L.top0 + r * L.rowH + L.rowH / 2;
       for (const it of row) {
         if (it.kind === "box") { g.fillStyle = it.color; g.fillRect(it.x, cy - L.sh / 2, L.sw, L.sh); }
-        else { g.strokeStyle = it.color; g.lineWidth = 1.5 * pt; g.beginPath(); g.moveTo(it.x, cy); g.lineTo(it.x + L.lineW, cy); g.stroke(); }
+        else {
+          const lw = it.lw || 1.5;
+          g.strokeStyle = it.color; g.lineWidth = lw * pt; g.lineCap = "butt";
+          g.setLineDash(it.dash ? dashPt(lw).map(v => v * pt) : []);
+          g.beginPath(); g.moveTo(it.x, cy); g.lineTo(it.x + it.mark, cy); g.stroke(); g.setLineDash([]);
+        }
         g.fillStyle = INK; g.font = L.font;
         g.fillText(it.name, it.x + it.mark + L.gapIn, cy);
       }
